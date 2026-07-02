@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type PointerEvent } from 'react'
 import type { RichMenu, RichMenuAction, RichMenuArea } from '@line-harness/sdk'
 import { useAccount } from '@/contexts/account-context'
 import Header from '@/components/layout/header'
@@ -20,6 +20,20 @@ type AreaForm = {
   y: number
   width: number
   height: number
+}
+
+type DraftImage = {
+  file: File
+  dataUrl: string
+  contentType: 'image/png' | 'image/jpeg'
+}
+
+type AreaDragState = {
+  areaId: string
+  mode: 'move' | 'resize'
+  startClientX: number
+  startClientY: number
+  initial: Pick<AreaForm, 'x' | 'y' | 'width' | 'height'>
 }
 
 const MAX_AREAS = 20
@@ -69,8 +83,8 @@ function toAction(area: AreaForm): RichMenuAction {
   const value = area.value.trim()
   if (area.type === 'message') return { type: 'message', text: value, label }
   if (area.type === 'postback') {
-    const displayText = area.displayText.trim() || area.label.trim() || value
-    return { type: 'postback', data: value, displayText, label }
+    const displayText = area.displayText.trim()
+    return { type: 'postback', data: value, ...(displayText ? { displayText } : {}), label }
   }
   if (area.type === 'richmenuswitch') {
     return {
@@ -83,10 +97,40 @@ function toAction(area: AreaForm): RichMenuAction {
   return { type: 'uri', uri: value, label }
 }
 
+function fromAction(action: RichMenuAction, index: number, bounds: RichMenuArea['bounds']): AreaForm {
+  const base = {
+    id: crypto.randomUUID(),
+    label: 'label' in action && action.label ? action.label : `エリア${index + 1}`,
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+  }
+
+  if (action.type === 'message') {
+    return { ...base, type: 'message', value: action.text, displayText: '' }
+  }
+
+  if (action.type === 'postback') {
+    return { ...base, type: 'postback', value: action.data, displayText: action.displayText ?? '' }
+  }
+
+  if (action.type === 'richmenuswitch') {
+    return { ...base, type: 'richmenuswitch', value: action.richMenuAliasId, displayText: action.data }
+  }
+
+  if (action.type === 'uri') {
+    return { ...base, type: 'uri', value: action.uri, displayText: '' }
+  }
+
+  return { ...base, type: 'postback', value: action.data, displayText: `${action.mode} picker` }
+}
+
 function actionSummary(action: RichMenuAction) {
   if (action.type === 'uri') return action.uri
   if (action.type === 'message') return action.text
   if (action.type === 'richmenuswitch') return `${action.richMenuAliasId} / ${action.data}`
+  if (action.type === 'datetimepicker') return `${action.mode} / ${action.data}`
   return action.data
 }
 
@@ -101,6 +145,23 @@ async function fileToDataUrl(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error)
     reader.readAsDataURL(file)
   })
+}
+
+async function urlToDraftImage(url: string, filename: string): Promise<DraftImage> {
+  const response = await fetch(url)
+  if (!response.ok) throw new Error('既存画像の読み込みに失敗しました')
+  const blob = await response.blob()
+  if (blob.type !== 'image/png' && blob.type !== 'image/jpeg') {
+    throw new Error('既存画像がPNG/JPEGではありません。画像を再アップロードしてください')
+  }
+  const file = new File([blob], filename, { type: blob.type })
+  const imageError = validateImageFile(file)
+  if (imageError) throw new Error(imageError)
+  return {
+    file,
+    dataUrl: await fileToDataUrl(file),
+    contentType: blob.type as 'image/png' | 'image/jpeg',
+  }
 }
 
 function validateAreas(areas: AreaForm[], size: { width: number; height: number }) {
@@ -121,6 +182,24 @@ function validateAreas(areas: AreaForm[], size: { width: number; height: number 
   return ''
 }
 
+function clampArea(area: AreaForm, size: { width: number; height: number }): AreaForm {
+  const width = Math.max(1, Math.min(Math.round(area.width), size.width))
+  const height = Math.max(1, Math.min(Math.round(area.height), size.height))
+  const x = Math.max(0, Math.min(Math.round(area.x), size.width - width))
+  const y = Math.max(0, Math.min(Math.round(area.y), size.height - height))
+  return { ...area, x, y, width, height }
+}
+
+function validateImageFile(file: File): string {
+  if (file.type !== 'image/png' && file.type !== 'image/jpeg') {
+    return '画像はPNGまたはJPEGを選択してください'
+  }
+  if (file.size > 1024 * 1024) {
+    return 'LINEの制約に合わせ、画像は1MB以下にしてください'
+  }
+  return ''
+}
+
 export default function RichMenusPage() {
   const { selectedAccountId, selectedAccount } = useAccount()
   const [menus, setMenus] = useState<RichMenu[]>([])
@@ -130,9 +209,13 @@ export default function RichMenusPage() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [showCreate, setShowCreate] = useState(false)
+  const [editingMenu, setEditingMenu] = useState<RichMenu | null>(null)
   const [createdRichMenuId, setCreatedRichMenuId] = useState('')
+  const [draftImage, setDraftImage] = useState<DraftImage | null>(null)
+  const [selectedAreaId, setSelectedAreaId] = useState<string | null>(null)
+  const [areaDrag, setAreaDrag] = useState<AreaDragState | null>(null)
   const [imagePreviews, setImagePreviews] = useState<Record<string, { url: string; key: string; mimeType: string }>>({})
-  const [aliasForm, setAliasForm] = useState({ richMenuAliasId: '', richMenuId: '' })
+  const [aliasForm, setAliasForm] = useState({ richMenuAliasId: '', richMenuId: '', oldRichMenuId: '' })
   const [form, setForm] = useState({
     name: 'メインメニュー',
     chatBarText: 'メニュー',
@@ -140,6 +223,7 @@ export default function RichMenusPage() {
     size: 'full' as SizePreset,
     layout: '6' as LayoutPreset,
     areas: createPresetAreas('6', 'full'),
+    setDefaultAfterCreate: false,
   })
 
   const load = useCallback(async () => {
@@ -175,9 +259,12 @@ export default function RichMenusPage() {
   const validationError = useMemo(() => {
     if (!form.name.trim()) return '管理名を入力してください'
     if (!form.chatBarText.trim()) return 'チャットバー表示を入力してください'
+    if (!draftImage) return '先にリッチメニュー画像を選択してください'
     return validateAreas(form.areas, size)
-  }, [form, size])
+  }, [draftImage, form, size])
   const canCreate = !validationError
+
+  const selectedArea = form.areas.find((area) => area.id === selectedAreaId) ?? form.areas[0] ?? null
 
   function applyLayout(layout: LayoutPreset) {
     setForm((prev) => {
@@ -192,11 +279,63 @@ export default function RichMenusPage() {
     })
   }
 
+  function resetCreateForm() {
+    setEditingMenu(null)
+    setCreatedRichMenuId('')
+    setDraftImage(null)
+    setSelectedAreaId(null)
+    setAreaDrag(null)
+    setForm({
+      name: 'メインメニュー',
+      chatBarText: 'メニュー',
+      selected: true,
+      size: 'full',
+      layout: '6',
+      areas: createPresetAreas('6', 'full'),
+      setDefaultAfterCreate: false,
+    })
+  }
+
+  async function startEdit(menu: RichMenu) {
+    setShowCreate(true)
+    setEditingMenu(menu)
+    setCreatedRichMenuId('')
+    setError('')
+    setNotice('')
+    const sizePreset: SizePreset = menu.size.height <= sizeOptions.half.height ? 'half' : 'full'
+    const areas = menu.areas.map((area, index) => fromAction(area.action, index, area.bounds))
+    setForm({
+      name: `${menu.name} の編集版`,
+      chatBarText: menu.chatBarText,
+      selected: menu.selected,
+      size: sizePreset,
+      layout: 'custom',
+      areas: areas.length ? areas : [newArea(0, sizePreset)],
+      setDefaultAfterCreate: false,
+    })
+    setSelectedAreaId(areas[0]?.id ?? null)
+
+    const preview = imagePreviews[menu.richMenuId]
+    if (!preview) {
+      setDraftImage(null)
+      setNotice('既存リッチメニューを編集フォームに読み込みました。画像は保存されていないため、再アップロードしてください。')
+      return
+    }
+
+    try {
+      setDraftImage(await urlToDraftImage(preview.url, `${menu.richMenuId}.${preview.mimeType === 'image/png' ? 'png' : 'jpg'}`))
+      setNotice('既存リッチメニューを編集フォームに読み込みました。保存すると新しいリッチメニューIDとして作成します。')
+    } catch (err) {
+      setDraftImage(null)
+      setNotice(err instanceof Error ? `${err.message} 編集保存前に画像を再アップロードしてください。` : '既存画像を読み込めませんでした。編集保存前に画像を再アップロードしてください。')
+    }
+  }
+
   function updateArea(id: string, patch: Partial<AreaForm>) {
     setForm((prev) => ({
       ...prev,
       layout: prev.layout === 'custom' ? prev.layout : 'custom',
-      areas: prev.areas.map((area) => area.id === id ? { ...area, ...patch } : area),
+      areas: prev.areas.map((area) => area.id === id ? clampArea({ ...area, ...patch }, sizeOptions[prev.size]) : area),
     }))
   }
 
@@ -217,6 +356,66 @@ export default function RichMenusPage() {
       layout: 'custom',
       areas: prev.areas.filter((area) => area.id !== id),
     }))
+    if (selectedAreaId === id) setSelectedAreaId(null)
+  }
+
+  async function handleDraftImage(file: File | undefined) {
+    if (!file) return
+    const imageError = validateImageFile(file)
+    if (imageError) {
+      setError(imageError)
+      return
+    }
+    setError('')
+    setNotice('')
+    setDraftImage({
+      file,
+      dataUrl: await fileToDataUrl(file),
+      contentType: file.type as 'image/png' | 'image/jpeg',
+    })
+  }
+
+  function handleAreaPointerDown(event: PointerEvent<HTMLElement>, area: AreaForm, mode: 'move' | 'resize') {
+    event.preventDefault()
+    event.stopPropagation()
+    setSelectedAreaId(area.id)
+    setAreaDrag({
+      areaId: area.id,
+      mode,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      initial: {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+      },
+    })
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+
+  function handlePreviewPointerMove(event: PointerEvent<HTMLDivElement>) {
+    if (!areaDrag) return
+    const rect = event.currentTarget.getBoundingClientRect()
+    const dx = ((event.clientX - areaDrag.startClientX) / rect.width) * size.width
+    const dy = ((event.clientY - areaDrag.startClientY) / rect.height) * size.height
+
+    if (areaDrag.mode === 'resize') {
+      updateArea(areaDrag.areaId, {
+        width: areaDrag.initial.width + dx,
+        height: areaDrag.initial.height + dy,
+      })
+      return
+    }
+
+    updateArea(areaDrag.areaId, {
+      x: areaDrag.initial.x + dx,
+      y: areaDrag.initial.y + dy,
+    })
+  }
+
+  function handlePreviewPointerUp() {
+    setAreaDrag(null)
   }
 
   async function handleCreate() {
@@ -246,8 +445,41 @@ export default function RichMenusPage() {
         chatBarText: form.chatBarText.trim(),
         areas,
       })
+      if (!draftImage) throw new Error('画像を選択してください')
+      const uploaded = await client.images.upload({
+        body: draftImage.file,
+        mimeType: draftImage.contentType,
+        filename: draftImage.file.name,
+      })
+      await client.richMenus.uploadImage(
+        result.richMenuId,
+        draftImage.dataUrl,
+        draftImage.contentType,
+        {
+          asset: {
+            key: uploaded.key,
+            url: uploaded.url,
+            mimeType: uploaded.mimeType,
+            size: uploaded.size,
+          },
+        },
+      )
+      if (form.setDefaultAfterCreate) {
+        await client.richMenus.setDefault(result.richMenuId)
+      }
       setCreatedRichMenuId(result.richMenuId)
-      setNotice('リッチメニューを作成しました。続けて画像アップロードと、必要ならエイリアス保存をしてください。')
+      setImagePreviews((prev) => ({
+        ...prev,
+        [result.richMenuId]: {
+          url: uploaded.url,
+          key: uploaded.key,
+          mimeType: uploaded.mimeType,
+        },
+      }))
+      setAliasForm((prev) => ({ ...prev, richMenuId: result.richMenuId }))
+      setNotice(editingMenu
+        ? `編集版リッチメニューを新規作成しました。旧ID ${editingMenu.richMenuId} は安全のため残しています。エイリアスを使っている場合は新IDへ保存し直してください。`
+        : '画像付きリッチメニューを作成しました。必要に応じてデフォルト設定やエイリアス保存をしてください。')
       await load()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'リッチメニュー作成に失敗しました')
@@ -258,12 +490,9 @@ export default function RichMenusPage() {
 
   async function handleUpload(richMenuId: string, file: File | undefined) {
     if (!file) return
-    if (file.type !== 'image/png' && file.type !== 'image/jpeg') {
-      setError('画像はPNGまたはJPEGを選択してください')
-      return
-    }
-    if (file.size > 1024 * 1024) {
-      setError('LINEの制約に合わせ、画像は1MB以下にしてください')
+    const imageError = validateImageFile(file)
+    if (imageError) {
+      setError(imageError)
       return
     }
     setUploadingId(richMenuId)
@@ -273,7 +502,7 @@ export default function RichMenusPage() {
       const image = await fileToDataUrl(file)
       const client = createLineHarnessClient(selectedAccountId)
       const uploaded = await client.images.upload({
-        data: image,
+        body: file,
         mimeType: file.type,
         filename: file.name,
       })
@@ -353,6 +582,34 @@ export default function RichMenusPage() {
     }
   }
 
+  async function handleReplaceAliasAndDeleteOld() {
+    const richMenuAliasId = aliasForm.richMenuAliasId.trim()
+    const richMenuId = aliasForm.richMenuId.trim()
+    const oldRichMenuId = aliasForm.oldRichMenuId.trim()
+    if (!richMenuAliasId || !richMenuId || !oldRichMenuId) {
+      setError('エイリアスID、新しいリッチメニューID、削除する旧リッチメニューIDを入力してください')
+      return
+    }
+    if (richMenuId === oldRichMenuId) {
+      setError('新しいリッチメニューIDと削除する旧リッチメニューIDが同じです')
+      return
+    }
+    const ok = confirm(`エイリアス ${richMenuAliasId} を新IDへ差し替えた後、旧リッチメニュー ${oldRichMenuId} を削除します。実行しますか？`)
+    if (!ok) return
+    setError('')
+    setNotice('')
+    try {
+      const client = createLineHarnessClient(selectedAccountId)
+      await client.richMenus.saveAlias(richMenuAliasId, richMenuId, { upsert: true })
+      await client.richMenus.delete(oldRichMenuId)
+      setNotice(`エイリアス ${richMenuAliasId} を ${richMenuId} に差し替え、旧リッチメニュー ${oldRichMenuId} を削除しました`)
+      setAliasForm((prev) => ({ ...prev, oldRichMenuId: '' }))
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'エイリアス差し替えまたは旧リッチメニュー削除に失敗しました')
+    }
+  }
+
   async function handleDeleteAlias() {
     const richMenuAliasId = aliasForm.richMenuAliasId.trim()
     if (!richMenuAliasId) {
@@ -379,7 +636,10 @@ export default function RichMenusPage() {
         description={`自由なタップ領域とタブ切替を設定します${selectedAccount ? ` / ${selectedAccount.displayName || selectedAccount.name}` : ''}`}
         action={
           <button
-            onClick={() => setShowCreate((value) => !value)}
+            onClick={() => {
+              if (!showCreate) resetCreateForm()
+              setShowCreate((value) => !value)
+            }}
             className="px-4 py-2 text-sm font-medium text-white rounded-lg transition-opacity hover:opacity-90"
             style={{ backgroundColor: '#06C755' }}
           >
@@ -424,17 +684,43 @@ export default function RichMenusPage() {
             <button onClick={() => void handleDeleteAlias()} className="rounded-lg bg-red-50 px-3 py-2 text-sm font-medium text-red-600">削除</button>
           </div>
         </div>
+        <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-[1fr_auto]">
+          <select
+            className="border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white"
+            value={aliasForm.oldRichMenuId}
+            onChange={(e) => setAliasForm((prev) => ({ ...prev, oldRichMenuId: e.target.value }))}
+          >
+            <option value="">差し替え後に削除する旧リッチメニューを選択</option>
+            {menus.map((menu) => (
+              <option key={menu.richMenuId} value={menu.richMenuId}>{menu.name} / {menu.richMenuId}</option>
+            ))}
+          </select>
+          <button onClick={() => void handleReplaceAliasAndDeleteOld()} className="rounded-lg bg-red-600 px-3 py-2 text-sm font-medium text-white">
+            差し替えて旧メニュー削除
+          </button>
+        </div>
       </section>
 
       {showCreate && (
         <section className="mb-6 bg-white rounded-lg border border-gray-200 p-6">
           <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
             <div>
-              <h2 className="text-sm font-semibold text-gray-900">新規リッチメニュー</h2>
-              <p className="mt-1 text-xs text-gray-500">最大20領域。座標はLINE画像サイズ上のpxで指定します。</p>
+              <h2 className="text-sm font-semibold text-gray-900">{editingMenu ? 'リッチメニューを編集して複製' : '新規リッチメニュー'}</h2>
+              <p className="mt-1 text-xs text-gray-500">
+                {editingMenu
+                  ? '既存IDは直接変更せず、新しいリッチメニューとして作成します。成功後は新IDをデフォルト設定やエイリアス保存に使えます。'
+                  : '画像を選んでから、画像上のタップ領域をドラッグして調整します。'}
+              </p>
             </div>
             <span className="text-xs text-gray-500">{form.areas.length}/{MAX_AREAS} 領域</span>
           </div>
+          {editingMenu && (
+            <div className="mt-4 rounded-lg border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800">
+              編集元ID: <span className="font-mono">{editingMenu.richMenuId}</span>
+              <br />
+              保存後は新しいIDが発行されます。旧メニューは自動削除しません。
+            </div>
+          )}
 
           <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-4">
             <label className="block">
@@ -466,29 +752,97 @@ export default function RichMenusPage() {
             <input type="checkbox" checked={form.selected} onChange={(e) => setForm({ ...form, selected: e.target.checked })} />
             初期表示でメニューを開く
           </label>
+          <label className="mt-3 inline-flex items-center gap-2 text-sm text-gray-700">
+            <input type="checkbox" checked={form.setDefaultAfterCreate} onChange={(e) => setForm({ ...form, setDefaultAfterCreate: e.target.checked })} />
+            作成成功後、この新しいリッチメニューをデフォルトに設定する
+          </label>
+
+          <div className="mt-5 rounded-lg border border-gray-200 bg-gray-50 p-4">
+            <label className="block text-xs font-medium text-gray-600 mb-2">1. 画像アップロード PNG/JPEG 1MB以下</label>
+            <input
+              type="file"
+              accept="image/png,image/jpeg"
+              onChange={(e) => void handleDraftImage(e.target.files?.[0])}
+              className="block w-full text-xs text-gray-500 file:mr-3 file:rounded-md file:border-0 file:bg-green-50 file:px-3 file:py-2 file:text-xs file:font-medium file:text-green-700"
+            />
+            {draftImage && (
+              <p className="mt-2 text-xs text-gray-500">
+                選択中: <span className="font-medium text-gray-700">{draftImage.file.name}</span>
+              </p>
+            )}
+          </div>
 
           <div className="mt-5 grid grid-cols-1 gap-5 xl:grid-cols-[minmax(320px,420px)_1fr]">
             <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
               <div className="mb-3 flex items-center justify-between text-xs text-gray-500">
-                <span>配置プレビュー</span>
+                <span>2. タップ領域プレビュー</span>
                 <span>{size.width} x {size.height}</span>
               </div>
-              <div className="relative overflow-hidden rounded-lg border border-gray-200 bg-white" style={{ aspectRatio: `${size.width} / ${size.height}` }}>
+              <div
+                className="relative overflow-hidden rounded-lg border border-gray-200 bg-white touch-none"
+                style={{ aspectRatio: `${size.width} / ${size.height}` }}
+                onPointerMove={handlePreviewPointerMove}
+                onPointerUp={handlePreviewPointerUp}
+                onPointerCancel={handlePreviewPointerUp}
+              >
+                {draftImage ? (
+                  <img
+                    src={draftImage.dataUrl}
+                    alt="rich menu draft"
+                    className="absolute inset-0 h-full w-full object-cover"
+                    draggable={false}
+                  />
+                ) : (
+                  <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-xs text-gray-400">
+                    先に画像を選択してください
+                  </div>
+                )}
                 {form.areas.map((area, index) => (
                   <div
                     key={area.id}
-                    className="absolute flex items-center justify-center border-2 border-green-500/80 bg-green-100/60 text-[10px] font-semibold text-green-900"
+                    className={`absolute flex cursor-move items-center justify-center border-2 text-[10px] font-semibold shadow-sm ${
+                      selectedAreaId === area.id
+                        ? 'border-blue-500 bg-blue-100/60 text-blue-950'
+                        : 'border-green-500/80 bg-green-100/50 text-green-950'
+                    }`}
                     style={{
                       left: `${(area.x / size.width) * 100}%`,
                       top: `${(area.y / size.height) * 100}%`,
                       width: `${(area.width / size.width) * 100}%`,
                       height: `${(area.height / size.height) * 100}%`,
                     }}
+                    onPointerDown={(event) => handleAreaPointerDown(event, area, 'move')}
                   >
-                    {index + 1}
+                    <span className="rounded bg-white/80 px-1">{index + 1}</span>
+                    <span
+                      className="absolute bottom-0 right-0 h-4 w-4 translate-x-1/2 translate-y-1/2 cursor-nwse-resize rounded-full border border-blue-600 bg-white"
+                      onPointerDown={(event) => handleAreaPointerDown(event, area, 'resize')}
+                    />
                   </div>
                 ))}
               </div>
+              {selectedArea && (
+                <div className="mt-3 rounded-lg border border-gray-200 bg-white p-3 text-xs text-gray-600">
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="font-semibold text-gray-800">選択中: {selectedArea.label || 'ラベルなし'}</span>
+                    <span className="text-gray-400">x:{selectedArea.x} y:{selectedArea.y}</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(['x', 'y', 'width', 'height'] as const).map((field) => (
+                      <label key={field} className="block">
+                        <span className="block text-[11px] font-medium text-gray-500 mb-1">{field}</span>
+                        <input
+                          type="number"
+                          min={field === 'x' || field === 'y' ? 0 : 1}
+                          className="w-full border border-gray-300 rounded-lg px-2 py-1.5 text-xs"
+                          value={selectedArea[field]}
+                          onChange={(e) => updateArea(selectedArea.id, { [field]: Number(e.target.value) } as Partial<AreaForm>)}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
               <button onClick={addArea} disabled={form.areas.length >= MAX_AREAS} className="mt-4 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm font-medium text-gray-700 disabled:opacity-50">
                 + タップ領域を追加
               </button>
@@ -498,7 +852,7 @@ export default function RichMenusPage() {
               {form.areas.map((area, index) => (
                 <div key={area.id} className="rounded-lg border border-gray-200 p-4">
                   <div className="mb-3 flex items-center justify-between">
-                    <p className="text-sm font-semibold text-gray-800">タップ領域 {index + 1}</p>
+                    <button onClick={() => setSelectedAreaId(area.id)} className="text-left text-sm font-semibold text-gray-800">タップ領域 {index + 1}</button>
                     <button onClick={() => removeArea(area.id)} className="text-xs font-medium text-red-600 disabled:opacity-40" disabled={form.areas.length <= 1}>削除</button>
                   </div>
 
@@ -575,9 +929,9 @@ export default function RichMenusPage() {
               className="px-4 py-2 text-sm font-medium text-white rounded-lg disabled:opacity-50"
               style={{ backgroundColor: '#06C755' }}
             >
-              {saving ? '作成中...' : '作成する'}
+              {saving ? '作成中...' : editingMenu ? '編集版を作成する' : '作成する'}
             </button>
-            <button onClick={() => setShowCreate(false)} className="px-4 py-2 text-sm font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200">
+            <button onClick={() => { setShowCreate(false); resetCreateForm() }} className="px-4 py-2 text-sm font-medium text-gray-600 bg-gray-100 rounded-lg hover:bg-gray-200">
               閉じる
             </button>
           </div>
@@ -651,11 +1005,17 @@ export default function RichMenusPage() {
               </div>
 
               <div className="mt-4 flex flex-wrap gap-2">
+                <button onClick={() => void startEdit(menu)} className="px-3 py-2 text-xs font-medium text-gray-700 bg-blue-50 hover:bg-blue-100 rounded-lg">
+                  編集して複製
+                </button>
                 <button onClick={() => void handleSetDefault(menu.richMenuId)} className="px-3 py-2 text-xs font-medium text-white rounded-lg" style={{ backgroundColor: '#06C755' }}>
                   デフォルト設定
                 </button>
                 <button onClick={() => setAliasForm((prev) => ({ ...prev, richMenuId: menu.richMenuId }))} className="px-3 py-2 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg">
                   エイリアス対象にする
+                </button>
+                <button onClick={() => setAliasForm((prev) => ({ ...prev, oldRichMenuId: menu.richMenuId }))} className="px-3 py-2 text-xs font-medium text-red-700 bg-red-50 hover:bg-red-100 rounded-lg">
+                  旧メニューに指定
                 </button>
                 <button onClick={() => void handleDelete(menu.richMenuId)} className="px-3 py-2 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded-lg">
                   削除

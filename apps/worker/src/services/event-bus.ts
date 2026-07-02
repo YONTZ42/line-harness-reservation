@@ -1,5 +1,3 @@
-import { extractFlexAltText } from '../utils/flex-alt-text.js';
-
 /**
  * イベントバス — システム内イベントの発火と処理
  *
@@ -13,7 +11,7 @@ import { extractFlexAltText } from '../utils/flex-alt-text.js';
 import {
   getActiveOutgoingWebhooksByEvent,
   applyScoring,
-  getActiveAutomationsByEvent,
+  getActiveAutomationsByEventForAccount,
   createAutomationLog,
   getActiveNotificationRulesByEvent,
   createNotification,
@@ -24,8 +22,8 @@ import {
   getFriendScore,
 } from '@line-crm/db';
 import { LineClient } from '@line-crm/line-sdk';
-import type { Message } from '@line-crm/line-sdk';
 import { sendAdConversions } from './ad-conversion.js';
+import { buildMessages } from './message-builder.js';
 
 export interface EventPayload {
   friendId?: string;
@@ -149,21 +147,45 @@ async function processAutomations(
   lineAccountId?: string | null,
 ): Promise<void> {
   try {
-    const allAutomations = await getActiveAutomationsByEvent(db, eventType);
-    // Filter by account: match this account's automations + unassigned (backward compat)
-    const automations = allAutomations.filter(
-      (a) => !a.line_account_id || !lineAccountId || a.line_account_id === lineAccountId,
-    );
+    const startedAt = Date.now();
+    const automations = await getActiveAutomationsByEventForAccount(db, eventType, lineAccountId);
+    const fetchMs = Date.now() - startedAt;
+    let parseAndMatchMs = 0;
+    let actionMs = 0;
+    let matchedCount = 0;
 
     for (const automation of automations) {
-      const conditions = JSON.parse(automation.conditions) as Record<string, unknown>;
-      const actions = JSON.parse(automation.actions) as Array<{ type: string; params: Record<string, string> }>;
+      const parseStartedAt = Date.now();
+      let conditions: Record<string, unknown>;
+      let actions: Array<{ type: string; params: Record<string, string> }>;
+      try {
+        conditions = JSON.parse(automation.conditions) as Record<string, unknown>;
+        const parsedActions = JSON.parse(automation.actions) as unknown;
+        if (!Array.isArray(parsedActions)) {
+          throw new Error('actions must be an array');
+        }
+        actions = parsedActions as Array<{ type: string; params: Record<string, string> }>;
+      } catch (err) {
+        await createAutomationLog(db, {
+          automationId: automation.id,
+          friendId: payload.friendId,
+          eventData: JSON.stringify(payload.eventData ?? {}),
+          actionsResult: JSON.stringify([{ action: 'parse', success: false, error: err instanceof Error ? err.message : String(err) }]),
+          status: 'failed',
+        });
+        parseAndMatchMs += Date.now() - parseStartedAt;
+        continue;
+      }
 
       // 条件チェック（簡易版: 条件が空なら常にマッチ）
-      if (!matchConditions(conditions, payload)) continue;
+      const matched = matchConditions(conditions, payload);
+      parseAndMatchMs += Date.now() - parseStartedAt;
+      if (!matched) continue;
+      matchedCount++;
 
       const results: Array<{ action: string; success: boolean; error?: string }> = [];
 
+      const actionStartedAt = Date.now();
       for (const action of actions) {
         try {
           await executeAction(db, action, payload, lineAccessToken);
@@ -173,6 +195,7 @@ async function processAutomations(
           results.push({ action: action.type, success: false, error: errorMsg });
         }
       }
+      actionMs += Date.now() - actionStartedAt;
 
       const allSuccess = results.every((r) => r.success);
       const anySuccess = results.some((r) => r.success);
@@ -184,6 +207,10 @@ async function processAutomations(
         actionsResult: JSON.stringify(results),
         status: allSuccess ? 'success' : anySuccess ? 'partial' : 'failed',
       });
+    }
+    const totalMs = Date.now() - startedAt;
+    if (eventType === 'rich_menu.tap' || totalMs >= 500) {
+      console.log(`[automation] event=${eventType} account=${lineAccountId ?? 'null'} candidates=${automations.length} matched=${matchedCount} fetchMs=${fetchMs} parseMatchMs=${parseAndMatchMs} actionMs=${actionMs} totalMs=${totalMs}`);
     }
   } catch (err) {
     console.error('processAutomations error:', err);
@@ -219,20 +246,36 @@ function matchConditions(
 
   // keyword_exact（完全一致）
   if (conditions.keyword_exact) {
-    const text = (payload.eventData?.text || '').trim();
-    if (text !== conditions.keyword_exact) {
+    const text = String(payload.eventData?.text ?? '').trim();
+    if (text !== String(conditions.keyword_exact)) {
       return false;
     }
   }
 
   if (conditions.postbackData !== undefined) {
+    const expected = String(conditions.postbackData);
+    const action = String(payload.eventData?.action ?? '');
     const postbackData = String(payload.eventData?.postbackData ?? payload.eventData?.rawData ?? '');
-    if (postbackData !== String(conditions.postbackData)) return false;
+    if (postbackData !== expected && action !== expected) return false;
   }
 
   if (conditions.postbackDataContains !== undefined) {
     const postbackData = String(payload.eventData?.postbackData ?? payload.eventData?.rawData ?? '');
     if (!postbackData.includes(String(conditions.postbackDataContains))) return false;
+  }
+
+  if (conditions.action !== undefined) {
+    const action = String(payload.eventData?.action ?? '');
+    const postbackData = String(payload.eventData?.postbackData ?? payload.eventData?.rawData ?? '');
+    const expected = String(conditions.action);
+    if (action !== expected && postbackData !== `action=${expected}` && !postbackData.includes(`action=${expected}`)) {
+      return false;
+    }
+  }
+
+  if (conditions.postbackAction !== undefined) {
+    const action = String(payload.eventData?.action ?? '');
+    if (action !== String(conditions.postbackAction)) return false;
   }
 
   if (conditions.eventDataEquals && typeof conditions.eventDataEquals === 'object') {
@@ -276,21 +319,15 @@ async function executeAction(
       break;
 
     case 'send_message': {
-      if (!lineAccessToken || !friendId) break;
+      if (!lineAccessToken || !friendId) throw new Error('lineAccessToken and friendId are required for send_message');
       const friend = await db
         .prepare('SELECT line_user_id FROM friends WHERE id = ?')
         .bind(friendId)
         .first<{ line_user_id: string }>();
-      if (!friend) break;
+      if (!friend) throw new Error(`friend not found: ${friendId}`);
       const lineClient = new LineClient(lineAccessToken);
       const msgType = action.params.messageType || 'text';
-      let msg: Message;
-      if (msgType === 'flex') {
-        const contents = JSON.parse(action.params.content);
-        msg = { type: 'flex', altText: action.params.altText || extractFlexAltText(contents), contents };
-      } else {
-        msg = { type: 'text', text: action.params.content };
-      }
+      const messages = buildMessages(msgType, action.params.content, action.params.altText);
       let deliveryType: 'reply' | 'push' = 'push';
       const delivery = action.params.delivery || 'reply_preferred';
       if (delivery === 'reply_only' && !payload.replyToken) {
@@ -301,7 +338,7 @@ async function executeAction(
       // Prefer replyMessage (free) when replyToken is available
       if (shouldUseReply && payload.replyToken) {
         try {
-          await lineClient.replyMessage(payload.replyToken, [msg]);
+          await lineClient.replyMessage(payload.replyToken, messages);
           deliveryType = 'reply';
           // replyToken is single-use, clear it so subsequent actions fall back to push
           payload.replyToken = undefined;
@@ -311,7 +348,7 @@ async function executeAction(
           const errMsg = err instanceof Error ? err.message : String(err);
           const isTokenError = errMsg.includes('400') || errMsg.includes('Invalid reply token');
           if (isTokenError && allowPushFallback) {
-            await lineClient.pushMessage(friend.line_user_id, [msg]);
+            await lineClient.pushMessage(friend.line_user_id, messages);
             deliveryType = 'push';
           } else {
             throw err;
@@ -321,14 +358,14 @@ async function executeAction(
         if (!allowPushFallback) {
           throw new Error(`delivery=${delivery} cannot send without a valid replyToken`);
         }
-        await lineClient.pushMessage(friend.line_user_id, [msg]);
+        await lineClient.pushMessage(friend.line_user_id, messages);
         deliveryType = 'push';
       }
       const now = jstNow();
-      const content = msg.type === 'flex' ? JSON.stringify(msg.contents) : msg.text;
+      const content = JSON.stringify(messages);
       await db
         .prepare(`INSERT INTO messages_log (id, friend_id, direction, message_type, content, delivery_type, source, created_at) VALUES (?, ?, 'outgoing', ?, ?, ?, 'automation', ?)`)
-        .bind(crypto.randomUUID(), friendId, msg.type, content, deliveryType, now)
+        .bind(crypto.randomUUID(), friendId, msgType, content, deliveryType, now)
         .run();
       await db
         .prepare(`UPDATE chats SET status = 'in_progress', last_message_at = ?, updated_at = ? WHERE friend_id = ?`)
@@ -391,7 +428,7 @@ async function executeAction(
           .replace(/\t/g, '\\t')
           .replace(/[\u0000-\u001f]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
       const raw = (action.params.data || '{}')
-        .replace(/\{\{message\}\}/g, escapeForJsonString(payload.eventData?.text || ''));
+        .replace(/\{\{message\}\}/g, escapeForJsonString(String(payload.eventData?.text ?? '')));
       const patch = JSON.parse(raw) as Record<string, unknown>;
       const merged = { ...current, ...patch };
       await db

@@ -11,6 +11,7 @@ import {
 import type { LineClient } from '@line-crm/line-sdk';
 import type { Message } from '@line-crm/line-sdk';
 import { jitterDeliveryTime, addJitter, sleep } from './stealth.js';
+import { buildMessages as buildLineMessages } from './message-builder.js';
 
 /**
  * Replace template variables in message content.
@@ -226,7 +227,7 @@ async function processSingleDelivery(
     trackedType = tracked.messageType;
     trackedContent = tracked.content;
   }
-  const message = buildMessage(trackedType, trackedContent);
+  const messages = buildLineMessages(trackedType, trackedContent);
   // Resolve the correct LINE client for this friend's account
   let deliveryClient = lineClient;
   const friendAccountId = (friend as unknown as Record<string, string | null>).line_account_id;
@@ -238,7 +239,7 @@ async function processSingleDelivery(
       deliveryClient = new LC(account.channel_access_token);
     }
   }
-  await deliveryClient.pushMessage(friend.line_user_id, [message]);
+  await deliveryClient.pushMessage(friend.line_user_id, messages);
 
   // Log outgoing message
   const logId = crypto.randomUUID();
@@ -385,3 +386,5 @@ export function buildMessage(messageType: string, messageContent: string, altTex
   // Fallback
   return { type: 'text', text: messageContent };
 }
+
+export const buildMessages = buildLineMessages;

@@ -4,7 +4,7 @@ import { workerBaseUrl } from '../services/line-bindings.js';
 
 const images = new Hono<Env>();
 
-// POST /api/images — upload image (base64 or binary)
+// POST /api/images — upload media (base64 or binary)
 images.post('/api/images', async (c) => {
   try {
     const contentType = c.req.header('Content-Type') || '';
@@ -40,15 +40,18 @@ images.post('/api/images', async (c) => {
     } else {
       data = await c.req.arrayBuffer();
       mimeType = contentType.split(';')[0] || 'image/png';
+      const headerFilename = c.req.header('X-Filename');
+      filename = headerFilename ? decodeURIComponent(headerFilename) : undefined;
     }
 
-    if (data.byteLength > 5 * 1024 * 1024) {
-      return c.json({ success: false, error: 'Image too large (max 5MB)' }, 400);
-    }
-
-    const allowedTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+    const allowedTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'video/mp4'];
     if (!allowedTypes.includes(mimeType)) {
-      return c.json({ success: false, error: `Unsupported image type: ${mimeType}. Allowed: ${allowedTypes.join(', ')}` }, 400);
+      return c.json({ success: false, error: `Unsupported media type: ${mimeType}. Allowed: ${allowedTypes.join(', ')}` }, 400);
+    }
+
+    const maxBytes = mimeType === 'video/mp4' ? 25 * 1024 * 1024 : 5 * 1024 * 1024;
+    if (data.byteLength > maxBytes) {
+      return c.json({ success: false, error: `Media too large (max ${mimeType === 'video/mp4' ? '25MB' : '5MB'})` }, 400);
     }
 
     const ext = mimeType.split('/')[1] === 'jpeg' ? 'jpg' : mimeType.split('/')[1];
@@ -73,7 +76,25 @@ images.post('/api/images', async (c) => {
   }
 });
 
-// GET /images/:key — serve image (public, no auth)
+// GET /images/imagemap/:key/:size — serve an imagemap base image variant.
+// LINE requests `${baseUrl}/{width}`. We reuse the uploaded base image for each size.
+images.get('/images/imagemap/:key/:size', async (c) => {
+  const key = c.req.param('key');
+  const object = await c.env.IMAGES.get(key);
+
+  if (!object) {
+    return c.json({ success: false, error: 'Image not found' }, 404);
+  }
+
+  const headers = new Headers();
+  headers.set('Content-Type', object.httpMetadata?.contentType || 'image/png');
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  headers.set('ETag', object.etag);
+
+  return new Response(object.body, { headers });
+});
+
+// GET /images/:key — serve media (public, no auth)
 images.get('/images/:key', async (c) => {
   const key = c.req.param('key');
   const object = await c.env.IMAGES.get(key);
