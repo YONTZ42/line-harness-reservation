@@ -311,13 +311,6 @@ function renderBookingControls(): string {
 function renderResourceCarousel(): string {
   return `
     <section class="booking-panel resource-choice-panel" aria-label="予約対象">
-      <div class="choice-heading">
-        <div>
-          <h2>予約対象を選ぶ</h2>
-          <p>横にスライドして、体験・場所を選択してください。</p>
-        </div>
-        <span>${state.resources.length}件</span>
-      </div>
       <div class="choice-carousel">
         ${state.resources.length === 0 ? '<p class="choice-empty">予約対象がありません。</p>' : state.resources.map((resource) => `
           <button
@@ -329,7 +322,6 @@ function renderResourceCarousel(): string {
           >
             ${resource.imageUrl ? `<img class="choice-card-image" src="${escapeHtml(resource.imageUrl)}" alt="${escapeHtml(resource.name)}" loading="lazy">` : ''}
             <strong>${escapeHtml(resource.name)}</strong>
-            ${resource.description ? `<small>${escapeHtml(resource.description)}</small>` : '<small>この体験を選択</small>'}
           </button>
         `).join('')}
       </div>
