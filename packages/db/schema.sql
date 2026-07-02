@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS friends (
   user_id          TEXT,
   ig_igsid         TEXT,
   ref_code         TEXT,
+  metadata         TEXT NOT NULL DEFAULT '{}',
   score            INTEGER NOT NULL DEFAULT 0,
   created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
   updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
@@ -599,12 +600,14 @@ CREATE TABLE IF NOT EXISTS automations (
   actions     TEXT NOT NULL DEFAULT '[]',
   is_active   INTEGER NOT NULL DEFAULT 1,
   priority    INTEGER NOT NULL DEFAULT 0,
+  line_account_id TEXT,
   created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
   updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_automations_event ON automations (event_type);
 CREATE INDEX IF NOT EXISTS idx_automations_active ON automations (is_active);
+CREATE INDEX IF NOT EXISTS idx_automations_line_account ON automations (line_account_id);
 
 CREATE TABLE IF NOT EXISTS automation_logs (
   id             TEXT PRIMARY KEY,

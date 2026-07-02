@@ -303,6 +303,7 @@ jobs:
               'DISCORD_RESERVATION_WEBHOOK_URL',
               'DISCORD_DAILY_WEBHOOK_URL',
               'DISCORD_REVIEW_WEBHOOK_URL',
+              'DISCORD_FORM_WEBHOOK_URL',
             ];
             const rawBindings = process.env.CF_SECRETS_STORE_BINDINGS?.trim();
             const bindingEntries = [
