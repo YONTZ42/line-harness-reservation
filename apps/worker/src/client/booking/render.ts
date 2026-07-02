@@ -509,7 +509,7 @@ function renderSlotModal(): string {
         </div>
         <button type="button" class="modal-close" data-action="close-slot-modal">×</button>
       </div>
-      <p class="capacity-note">選択した時間枠の間にご来店ください。たとえば10:00-11:00の枠は、10:00ちょうどではなく11:00までのご来店で大丈夫です。</p>
+      <p class="capacity-note">選択した枠の時間にご来店ください。焦らずゆったりとお越しいただき、ブルーベリー農園でのひとときをお楽しみください。</p>
       ${validationError('slot')}
       <div class="slots-grid">
         ${slots.map((slot) => {
