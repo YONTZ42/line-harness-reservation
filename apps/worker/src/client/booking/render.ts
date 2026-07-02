@@ -1,8 +1,8 @@
 import { addDays, dateToString, formatDateJa, formatTime, isPastDate } from './date.js';
 import { escapeHtml } from './html.js';
 import { capacityCountLabels } from './people.js';
-import { calculateEstimatedTotal, formatYen, hasAnyMenuPrice } from './pricing.js';
-import { capacityPeople, selectedMenu, state, totalPeople } from './state.js';
+import { calculateEstimatedTotal, formatYen, hasAnyMenuPrice, hasPrice } from './pricing.js';
+import { capacityPeople, selectedMenu, selectedResource, state, totalPeople } from './state.js';
 import { tokenForReservation } from './tokens.js';
 import type { AvailabilitySummary, Menu, Slot } from './types.js';
 
@@ -62,6 +62,19 @@ function parseNote(formData?: string | null): string {
   } catch {
     return '';
   }
+}
+
+function renderMenuPriceSummary(menu: Menu | null | undefined): string {
+  if (!hasAnyMenuPrice(menu) || !menu) {
+    return '<p class="price-note">料金は当日・現地でご確認ください。</p>';
+  }
+  const rows = [
+    hasPrice(menu.priceAdult) ? `大人 ${formatYen(menu.priceAdult)}` : null,
+    hasPrice(menu.priceChild) ? `小学生 ${formatYen(menu.priceChild)}` : null,
+    hasPrice(menu.priceInfant) ? `幼児 ${formatYen(menu.priceInfant)}` : null,
+    hasPrice(menu.priceUnderThree) ? `3歳以下 ${formatYen(menu.priceUnderThree)}` : null,
+  ].filter(Boolean);
+  return `<div class="price-chips" aria-label="料金単価">${rows.map((row) => `<span>${escapeHtml(row ?? '')}</span>`).join('')}</div>`;
 }
 
 function renderPriceEstimate(menu: Menu | null | undefined, counts: { adultCount: number; childCount: number; infantCount: number; underThreeCount: number }, compact = false): string {
@@ -233,7 +246,8 @@ function renderCafeMenuModal(menuItems: Array<{ id: string; name: string; price:
 function renderBooking(): string {
   return `
     ${renderLineLinkPanel()}
-    ${renderMenuCards()}
+    ${renderResourceCarousel()}
+    ${renderBookingControls()}
     ${renderViewToggle()}
     ${state.viewMode === 'week' ? renderWeekAvailability() : renderMonthAvailability()}
     ${renderSlotModal()}
@@ -266,20 +280,48 @@ function renderLineLinkPanel(): string {
   `;
 }
 
-function renderMenuCards(): string {
+function renderBookingControls(): string {
+  const menu = selectedMenu();
+  const resource = selectedResource();
   return `
-    <section class="booking-panel resource-choice-panel" aria-label="予約メニュー">
+    <section class="booking-panel">
+      <div class="section-title-row">
+        <div>
+          <h2>予約内容</h2>
+          <p>${resource ? `${escapeHtml(resource.name)} / ` : ''}${menu ? escapeHtml(menu.name) : 'メニューを選択してください'}</p>
+        </div>
+      </div>
       ${state.notice ? `<p class="error">${escapeHtml(state.notice)}</p>` : ''}
+      <label class="field-label">
+        メニュー ${requiredBadge()}
+        <select data-field="menuId">
+          ${state.menus.length === 0 ? '<option value="">メニューがありません</option>' : state.menus.map((item) => `
+            <option value="${escapeHtml(item.id)}" ${item.id === state.menuId ? 'selected' : ''}>
+              ${escapeHtml(item.name)}
+            </option>
+          `).join('')}
+        </select>
+        ${validationError('menuId')}
+      </label>
+      ${renderMenuPriceSummary(menu)}
+    </section>
+  `;
+}
+
+function renderResourceCarousel(): string {
+  return `
+    <section class="booking-panel resource-choice-panel" aria-label="予約対象">
       <div class="choice-carousel">
-        ${state.menus.length === 0 ? '<p class="choice-empty">予約メニューがありません。</p>' : state.menus.map((menu) => `
+        ${state.resources.length === 0 ? '<p class="choice-empty">予約対象がありません。</p>' : state.resources.map((resource) => `
           <button
             type="button"
-            class="choice-card menu-choice-card ${menu.id === state.menuId ? 'selected' : ''}"
-            data-action="select-menu"
-            data-menu-id="${escapeHtml(menu.id)}"
-            aria-pressed="${menu.id === state.menuId ? 'true' : 'false'}"
+            class="choice-card resource-card ${resource.id === state.resourceId ? 'selected' : ''} ${resource.imageUrl ? 'has-image' : 'no-image'}"
+            data-action="select-resource"
+            data-resource-id="${escapeHtml(resource.id)}"
+            aria-pressed="${resource.id === state.resourceId ? 'true' : 'false'}"
           >
-            <strong>${escapeHtml(menu.name)}</strong>
+            ${resource.imageUrl ? `<img class="choice-card-image" src="${escapeHtml(resource.imageUrl)}" alt="${escapeHtml(resource.name)}" loading="lazy">` : ''}
+            <strong>${escapeHtml(resource.name)}</strong>
           </button>
         `).join('')}
       </div>
