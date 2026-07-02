@@ -322,6 +322,7 @@ function renderResourceCarousel(): string {
           >
             ${resource.imageUrl ? `<img class="choice-card-image" src="${escapeHtml(resource.imageUrl)}" alt="${escapeHtml(resource.name)}" loading="lazy">` : ''}
             <strong>${escapeHtml(resource.name)}</strong>
+            ${resource.description ? `<small>${escapeHtml(resource.description)}</small>` : '<small>この体験を選択</small>'}
           </button>
         `).join('')}
       </div>
@@ -505,11 +506,10 @@ function renderSlotModal(): string {
       <div class="modal-header">
         <div>
           <h2>${formatDateJa(state.selectedDate)}の時間</h2>
-          <p>時間枠を選ぶと、人数と受付情報の入力に進みます。</p>
         </div>
         <button type="button" class="modal-close" data-action="close-slot-modal">×</button>
       </div>
-      <p class="capacity-note">空き枠は「${escapeHtml(capacityCountLabels())}」をもとに計算します。3歳以下など枠を消費しない人数区分は、管理設定に従って予約枠から除外されます。</p>
+      <p class="capacity-note">選択した時間枠の間にご来店ください。たとえば10:00-11:00の枠は、10:00ちょうどではなく11:00までのご来店で大丈夫です。</p>
       ${validationError('slot')}
       <div class="slots-grid">
         ${slots.map((slot) => {
